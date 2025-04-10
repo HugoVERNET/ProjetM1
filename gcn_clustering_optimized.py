@@ -14,6 +14,109 @@ import re
 from collections import defaultdict
 import gc
 
+# --- Générer et Sauvegarder un Graphe ---
+def generate_and_save_graph(filepath, patient_id, patient_labels, output_dir, use_edge_weights=False):
+    y = patient_labels.get(patient_id, torch.tensor([-1, -1], dtype=torch.long))
+    df_data = pd.read_csv(filepath)
+    print(f"Taille : {df_data.shape[0]} lignes, {df_data.shape[1]} colonnes")
+
+    if np.any(pd.isna(df_data)):
+        print(f"Ignoré {filepath} : Contient des valeurs NaN")
+        return None
+
+    features = df_data.values
+    x = torch.tensor(features, dtype=torch.float)
+    print(f"Calcul des distances pour {os.path.basename(filepath)}")
+    dist_matrix = euclidean_distances(x.numpy())
+    
+    num_nodes = x.shape[0]
+    threshold = np.percentile(dist_matrix, 10)
+    edge_index = []
+    edge_weight = [] if use_edge_weights else None
+    for i in range(num_nodes):
+        for j in range(i + 1, num_nodes):
+            dist = dist_matrix[i][j]
+            if dist < threshold:
+                edge_index.append([i, j])
+                edge_index.append([j, i])
+                if use_edge_weights:
+                    weight = 1.0 / (dist + 1e-8)
+                    edge_weight.append(weight)
+                    edge_weight.append(weight)
+
+    if not edge_index:
+        edge_index = [[0, 1], [1, 0]] if num_nodes > 1 else [[0, 0]]
+        if use_edge_weights:
+            edge_weight = [1.0, 1.0] if num_nodes > 1 else [1.0]
+
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    if use_edge_weights and edge_weight:
+        edge_weight = np.array(edge_weight)
+        edge_weight = (edge_weight - edge_weight.min()) / (edge_weight.max() - edge_weight.min() + 1e-8)
+        edge_weight = torch.tensor(edge_weight, dtype=torch.float)
+
+    if y[0] != -1 or y[1] != -1:
+        graph = Data(x=x, edge_index=edge_index, y=y)
+        if use_edge_weights:
+            graph.edge_weight = edge_weight
+        graph_path = os.path.join(output_dir, f"{patient_id}_{os.path.basename(filepath).replace('.csv', '')}.pt")
+        torch.save(graph, graph_path)
+        print(f"Graphe créé et sauvegardé : {graph_path}")
+        return graph_path
+    return None
+
+# --- Charger et Préparer les Données (Génération des Graphes, Commentée par Défaut) ---
+def prepare_graphs(cluster_dir, rtmlpa_file, clinical_file, output_dir, use_edge_weights=False):
+    df_rtmlpa = pd.read_csv(rtmlpa_file)
+    df_clinical = pd.read_csv(clinical_file)
+    
+    df_clinical = df_clinical.dropna(subset=['N° patient'])
+    df_clinical['N° patient'] = df_clinical['N° patient'].astype(float).astype(int)
+    df = pd.merge(df_rtmlpa, df_clinical, left_on='patient_id', right_on='N° patient', how='inner')
+    
+    patient_labels = {}
+    for _, row in df.iterrows():
+        patient_id = str(row['patient_id']).zfill(3)
+        response = row['Reponse 1ere ligne']
+        label = row['label']
+        posneg = -1
+        try:
+            response = float(response)
+            if response in [1, 2, 3]:
+                posneg = 1
+            elif response in [4, 5]:
+                posneg = 0
+        except (ValueError, TypeError):
+            pass
+        subtype = -1
+        if label == 'ABC':
+            subtype = 0
+        elif label == 'GCB':
+            subtype = 1
+        patient_labels[patient_id] = torch.tensor([posneg, subtype], dtype=torch.long)
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    graph_paths = []
+    filename_to_graph = {}
+    for root, _, files in os.walk(cluster_dir):
+        for filename in files:
+            if filename.endswith('.csv'):
+                filepath = os.path.join(root, filename)
+                patient_id = os.path.basename(root)
+                if not re.match(r'^\d{3}$', patient_id):
+                    print(f"Avertissement : Dossier {root} ne correspond pas à un ID patient valide, ignoré")
+                    continue
+                print(f"Chargement : {filepath}")
+                graph_path = generate_and_save_graph(filepath, patient_id, patient_labels, output_dir, use_edge_weights)
+                if graph_path:
+                    graph_paths.append(graph_path)
+                    filename_to_graph[filepath] = graph_path
+
+    print(f"Créé {len(graph_paths)} graphes à partir de {cluster_dir}")
+    return graph_paths, filename_to_graph
+
 # --- Charger les Graphes Existants ---
 def load_existing_graphs(cluster_dir, output_dir):
     graph_paths = []
@@ -281,13 +384,14 @@ def main():
     parser.add_argument('--rtmlpa_file', type=str, default='RTMLPA.csv', help='Fichier RTMLPA.csv')
     parser.add_argument('--clinical_file', type=str, default='clinical.csv', help='Fichier clinical.csv')
     parser.add_argument('--size', type=str, choices=['petit', 'moyen', 'grand'], default='petit', help='Taille du modèle')
-    parser.add_argument('--num_epochs', type=int, default=3, help='Nombre d’époques d’entraînement')  # Réduit pour tester
+    parser.add_argument('--num_epochs', type=int, default=3, help='Nombre d’époques d’entraînement')
     parser.add_argument('--batch_size', type=int, default=8, help='Taille du lot')
     parser.add_argument('--lr', type=float, default=0.001, help='Taux d’apprentissage')
     parser.add_argument('--train_size', type=float, default=0.7, help='Proportion de l’ensemble d’entraînement')
     parser.add_argument('--val_size', type=float, default=0.15, help='Proportion de l’ensemble de validation')
     parser.add_argument('--output_dir', type=str, default='./models', help='Répertoire pour sauvegarder les modèles entraînés')
     parser.add_argument('--checkpoint', type=str, help='Chemin vers le point de contrôle pour l’inférence')
+    parser.add_argument('--regenerate_graphs', action='store_true', help='Régénérer les graphes au lieu de charger les existants')
 
     args = parser.parse_args()
 
@@ -295,9 +399,12 @@ def main():
     print(f"Utilisation du périphérique : {device}")
 
     graph_dir = './graphs_temp'
-    graph_paths, filename_to_graph = load_existing_graphs(args.cluster_dir, graph_dir)
+    if args.regenerate_graphs:
+        graph_paths, filename_to_graph = prepare_graphs(args.cluster_dir, args.rtmlpa_file, args.clinical_file, graph_dir, use_edge_weights=False)
+    else:
+        graph_paths, filename_to_graph = load_existing_graphs(args.cluster_dir, graph_dir)
     if not graph_paths:
-        print("Aucun graphe valide chargé. Sortie.")
+        print("Aucun graphe valide chargé ou créé. Sortie.")
         return
 
     input_dim = torch.load(graph_paths[0]).x.shape[1]
@@ -332,5 +439,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-             
